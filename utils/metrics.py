@@ -4,15 +4,18 @@ Every metric here takes `(embeds, baseline)`, two (n_test, dim) arrays aligned r
 (row i is the same test row in both), and returns one float, higher meaning more related.
 They differ in what they need that alignment *for*:
 
-- `cosine`: a per-row, deterministic measure - row i's cosine similarity only ever needs
-  row i's two vectors, then the per-row values are averaged over the n_test rows.
-- `mi` and `cka`: neither is defined for a single pair of vectors. Both instead treat the
-  n_test rows as a sample from a joint distribution over (baseline, perturbed) and estimate
-  a single number for the whole batch - there is no per-row value to average, the n_test
-  rows are consumed together as the estimator's sample.
+- `cosine` and `ccos`: per-row, deterministic measures - row i's value only ever needs row i's
+  two vectors, then the per-row values are averaged over the n_test rows.
+- `nmi` and `dcka`: neither is defined for a single pair of vectors. Both instead treat the
+  n_test rows as a sample from a joint distribution over (baseline, perturbed) and estimate a
+  single number for the whole batch.
 
-METRICS maps the --metric CLI choices to these functions.
+The raw `mi` and the biased `cka` were dropped: `nmi` and `dcka` are their versions whose scale
+does not depend on the dataset (see their docstrings). METRICS maps the --metric CLI choices to
+these functions and to the label of their plot axis.
 """
+
+from collections import namedtuple
 
 import numpy as np
 from sklearn.feature_selection import mutual_info_regression
@@ -32,26 +35,20 @@ def _as_rows(embeds, baseline, name):
     return embeds, baseline
 
 
-def cosine_sim_to_baseline(embeds, baseline):
-    """Cosine similarity between two sets of embeddings, computed on the last axis.
+def cosine_metric(embeds, baseline):
+    """Cosine similarity between each perturbed row and its baseline row, averaged over rows.
 
     Args:
-        embeds (np.ndarray): The perturbed embeddings.
+        embeds (np.ndarray): The perturbed embeddings, shape (n_test, dim).
         baseline (np.ndarray): The unperturbed embeddings, same shape as `embeds`.
 
     Returns:
-        np.ndarray: The per-sample cosine similarities.
+        float: The mean cosine similarity.
     """
-    embeds = np.asarray(embeds)
-    baseline = np.asarray(baseline)
+    embeds, baseline = np.asarray(embeds), np.asarray(baseline)
     num = np.sum(embeds * baseline, axis=-1)
     denom = np.linalg.norm(embeds, axis=-1) * np.linalg.norm(baseline, axis=-1)
-    return num / denom
-
-
-def cosine_metric(embeds, baseline):
-    """The `cosine_sim_to_baseline` per-row values, reduced to one float by averaging."""
-    return float(cosine_sim_to_baseline(embeds, baseline).mean())
+    return float((num / denom).mean())
 
 
 def ccos_metric(embeds, baseline):
@@ -71,76 +68,38 @@ def ccos_metric(embeds, baseline):
     return cosine_metric(embeds - mean, baseline - mean)
 
 
-# Embedding dimensions are typically in the dozens to hundreds; mi_metric fits one k-NN
+# Embedding dimensions are typically in the dozens to hundreds; nmi_metric fits one k-NN
 # regressor per dimension, so its cost is O(dim) forward passes through sklearn's
 # estimator. Past this many dimensions, a fixed, seeded random subset is used instead of
-# all of them, to keep a run tractable - see mi_metric's docstring.
+# all of them, to keep a run tractable.
 MI_MAX_DIMS = 64
 
 
-def mi_metric(embeds, baseline, max_dims=MI_MAX_DIMS, seed=0):
-    """Mutual information between baseline and perturbed embeddings, per dimension.
+def nmi_metric(embeds, baseline, max_dims=MI_MAX_DIMS, seed=0):
+    """Normalized mutual information between baseline and perturbed embeddings, per dimension.
 
-    A single pair of embedding vectors has no defined MI (unlike cosine similarity, which
-    needs nothing beyond the two vectors themselves): mutual information is a property of
-    a joint distribution, and estimating one needs a sample. The only sample available
-    here is the n_test test rows, so this estimates MI one embedding dimension at a time
-    - for dimension d, `baseline[:, d]` and `embeds[:, d]` (each of length n_test) are fed
-    to a k-nearest-neighbour estimator (`sklearn.feature_selection.mutual_info_regression`,
-    the Kraskov-Stogbauer-Grassberger estimator) - and averages the per-dimension MI.
+    A single pair of embedding vectors has no defined MI: it is a property of a joint
+    distribution, and estimating one needs a sample, here the n_test test rows. So MI is
+    estimated one embedding dimension at a time - `baseline[:, d]` against `embeds[:, d]`, with
+    the k-nearest-neighbour (Kraskov-Stogbauer-Grassberger) estimator of
+    `sklearn.feature_selection.mutual_info_regression` - and divided by the baseline's MI with
+    itself, the fraction of each dimension's information the perturbed embedding still carries,
+    1 when unchanged. This treats the dimensions as independent: a joint k-NN estimate in the
+    full embedding dimension is not reliable at these sample sizes (`dcka` is the joint view).
 
-    This is *not* the joint, multivariate MI between the two full embedding vectors (that
-    would need a k-NN density estimate in the full embedding dimension, which the curse of
-    dimensionality makes unreliable at the sample sizes n_test gives here, a few hundred to
-    about a thousand rows against embeddings that can be as wide or wider); averaging
-    per-dimension MI instead treats each dimension as independent, missing any dependence
-    that only shows up jointly across dimensions, in exchange for an estimate that stays
-    numerically meaningful at this sample size. `cka_metric` is the joint alternative.
+    The estimator cannot return an infinite MI for a variable against itself: it tops out near
+    log(n_test), so raw MI values have a ceiling set by the test-set size (about 2.6 nats on iris
+    against 3.6 on digits), not by the embeddings. Dividing each dimension by that ceiling,
+    measured on the baseline itself, removes it, so curves can be compared across datasets.
+    Dimensions constant over the test set carry no information and are left out.
 
     Args:
         embeds (np.ndarray): The perturbed embeddings, shape (n_test, dim).
         baseline (np.ndarray): The unperturbed embeddings, same shape as `embeds`.
-        max_dims (int, optional): Past this many dimensions, a fixed, seeded random subset
-            is used instead of every dimension, since cost scales with the dimension count
-            used. Defaults to MI_MAX_DIMS.
+        max_dims (int, optional): Past this many dimensions, a fixed, seeded random subset is
+            used, since the cost scales with the number of dimensions. Defaults to MI_MAX_DIMS.
         seed (int, optional): Seed of that subset, and of the estimator's own tie-breaking
             noise, so repeated calls on the same embeddings agree. Defaults to 0.
-
-    Returns:
-        float: The per-dimension MI, averaged over the dimensions used.
-    """
-    embeds, baseline = _as_rows(embeds, baseline, "mi")
-    dim = baseline.shape[1]
-
-    dims = range(dim)
-    if dim > max_dims:
-        dims = np.random.default_rng(seed).choice(dim, size=max_dims, replace=False)
-        if not getattr(mi_metric, "_subset_note_shown", False):
-            print(f"  mi: {dim} dims > max_dims={max_dims}, using a random {max_dims}-dim subset")
-            mi_metric._subset_note_shown = True
-
-    per_dim = [
-        mutual_info_regression(baseline[:, [d]], embeds[:, d], random_state=seed)[0] for d in dims
-    ]
-    return float(np.mean(per_dim))
-
-
-def nmi_metric(embeds, baseline, max_dims=MI_MAX_DIMS, seed=0):
-    """`mi_metric` divided by the baseline's MI with itself, per dimension: the fraction of
-    each dimension's information the perturbed embedding still carries, 1 when unchanged.
-
-    The k-NN estimator cannot return an infinite MI for a variable against itself: it tops
-    out near log(n_test), so raw `mi` values have a ceiling set by the test-set size (about
-    2.6 nats on iris against 3.6 on digits), not by the embeddings. Dividing each dimension
-    by that ceiling, measured on the baseline itself, removes it, so curves can be compared
-    across datasets. Dimensions constant over the test set carry no information and are
-    left out (their ratio is undefined).
-
-    Args:
-        embeds (np.ndarray): The perturbed embeddings, shape (n_test, dim).
-        baseline (np.ndarray): The unperturbed embeddings, same shape as `embeds`.
-        max_dims (int, optional): As in `mi_metric`. Defaults to MI_MAX_DIMS.
-        seed (int, optional): As in `mi_metric`. Defaults to 0.
 
     Returns:
         float: The per-dimension normalized MI, averaged over the informative dimensions.
@@ -174,32 +133,15 @@ def _self_mi(column, seed):
     return _SELF_MI_CACHE[key]
 
 
-def _pairwise_sq_dists(X):
-    """Squared Euclidean distance between every pair of rows of X, shape (n, n)."""
-    sq_norms = np.sum(X**2, axis=1)
-    sq_dists = sq_norms[:, None] + sq_norms[None, :] - 2 * X @ X.T
-    return np.clip(sq_dists, 0, None)  # float error can make a same-point distance slightly < 0
-
-
 def _rbf_gram(X):
     """RBF Gram matrix of X, bandwidth set by the median heuristic (median pairwise
     distance of X itself), so it adapts to each embedding's own scale."""
-    sq_dists = _pairwise_sq_dists(X)
-    n = len(X)
-    off_diag = sq_dists[~np.eye(n, dtype=bool)]
+    sq_norms = np.sum(X**2, axis=1)
+    # float error can make a same-point distance slightly < 0
+    sq_dists = np.clip(sq_norms[:, None] + sq_norms[None, :] - 2 * X @ X.T, 0, None)
+    off_diag = sq_dists[~np.eye(len(X), dtype=bool)]
     sigma_sq = max(np.median(off_diag), 1e-12) / 2
     return np.exp(-sq_dists / (2 * sigma_sq))
-
-
-def _center_gram(K):
-    """`H @ K @ H` for the centering matrix H = I - 1/n, computed in O(n^2) not O(n^3)."""
-    return K - K.mean(axis=0, keepdims=True) - K.mean(axis=1, keepdims=True) + K.mean()
-
-
-def _hsic(K, L):
-    """Biased HSIC estimator of two (already Gram, not yet centered) matrices K, L."""
-    n = K.shape[0]
-    return float(np.sum(_center_gram(K) * _center_gram(L)) / (n - 1) ** 2)
 
 
 def _hsic_unbiased(K, L):
@@ -215,15 +157,18 @@ def _hsic_unbiased(K, L):
 
 
 def dcka_metric(embeds, baseline):
-    """Debiased CKA: `cka_metric` with the unbiased HSIC estimator in place of the biased one.
+    """Debiased Centered Kernel Alignment between baseline and perturbed embeddings.
 
-    The biased estimator behind `cka_metric` reads two completely independent embeddings
-    as similar when the embedding is wide against the number of test rows (independent
-    Gaussian embeddings: 0.78 at 50 rows x 64 dims, 0.99 at 188 rows x 4096 dims), so its
-    floor changes from one dataset and layer to the next. The unbiased estimator removes
-    that: independent embeddings read about 0 at any size, identical ones still exactly 1.
-    It can come out slightly negative (estimation noise around 0). This is the "debiased
-    CKA" of Kornblith et al.'s own code (Nguyen et al. 2021).
+    CKA (Kornblith et al. 2019) is built on HSIC, a kernel dependence measure between the
+    n_test x n_test Gram matrices (RBF kernel, its bandwidth set from each embedding's own
+    median pairwise distance) of the two embeddings: it reads every dimension jointly and never
+    estimates a density. The usual, biased HSIC estimator reads two completely independent
+    embeddings as similar when the embedding is wide against the number of test rows
+    (independent Gaussian embeddings: 0.78 at 50 rows x 64 dims, 0.99 at 188 rows x 4096 dims),
+    so its floor changes from one dataset and layer to the next. The unbiased estimator used
+    here removes that: independent embeddings read about 0 at any size, identical ones exactly 1.
+    It can come out slightly negative (estimation noise around 0). This is the "debiased CKA"
+    of Kornblith et al.'s own code (Nguyen et al. 2021).
 
     Args:
         embeds (np.ndarray): The perturbed embeddings, shape (n_test, dim).
@@ -240,52 +185,45 @@ def dcka_metric(embeds, baseline):
     return hsic_xy / np.sqrt(hsic_xx * hsic_yy)
 
 
-def cka_metric(embeds, baseline):
-    """Centered Kernel Alignment (CKA) between baseline and perturbed embeddings.
+def hsic_metric(embeds, baseline):
+    """HSIC between baseline and perturbed embeddings, relative to the baseline's own HSIC.
 
-    Like `mi_metric`, a single pair of embedding vectors has no defined CKA: it needs a
-    sample, here the n_test test rows, same as MI. Unlike MI though, it reads them jointly,
-    across every dimension at once, rather than one dimension at a time - so it does not
-    have the same curse-of-dimensionality problem MI does at these embedding widths. CKA is
-    built on HSIC (the Hilbert-Schmidt Independence Criterion), a kernel-based dependence
-    measure: it never estimates a density, only pairwise-kernel (here RBF, its bandwidth
-    set from each embedding's own median pairwise distance) second-order statistics between
-    the n_test x n_test Gram matrices of the two embeddings, which is why it stays reliable
-    at far smaller sample-to-dimension ratios than MI's k-NN density estimate does. This is
-    the same tool (Kornblith et al. 2019) used to compare neural network representations
-    directly - exactly this project's baseline-vs-perturbed setting.
+    The same unbiased HSIC estimator and RBF kernels as `dcka_metric`, but normalised by the
+    baseline alone, HSIC(base, pert) / HSIC(base, base), where CKA divides by
+    sqrt(HSIC(base, base) * HSIC(pert, pert)). It is 1 when the embeddings are unchanged and
+    about 0 when they are independent, and unlike CKA it also drops when a perturbation makes the
+    perturbed embedding's own structure weaker (less dependence among its rows), not only when
+    it rotates it away from the baseline's. Raw HSIC has the scale of the kernels; dividing by a
+    quantity of the baseline only keeps every comparison against one baseline (every column of
+    a table) on the same scale as raw HSIC, so rankings and ratio-based cuts are unchanged by it.
 
     Args:
         embeds (np.ndarray): The perturbed embeddings, shape (n_test, dim).
         baseline (np.ndarray): The unperturbed embeddings, same shape as `embeds`.
 
     Returns:
-        float: The CKA similarity, in [0, 1].
+        float: The relative HSIC, about 0 for independent, 1 for identical.
     """
-    embeds, baseline = _as_rows(embeds, baseline, "cka")
-
+    embeds, baseline = _as_rows(embeds, baseline, "hsic")
     K, L = _rbf_gram(baseline), _rbf_gram(embeds)
-    hsic_xy, hsic_xx, hsic_yy = _hsic(K, L), _hsic(K, K), _hsic(L, L)
-    denom = np.sqrt(hsic_xx * hsic_yy)
-    return hsic_xy / denom if denom > 0 else 0.0
+    hsic_xx = _hsic_unbiased(K, K)
+    if hsic_xx <= 0:
+        return 0.0
+    return _hsic_unbiased(K, L) / hsic_xx
 
 
-# The --metric CLI choices, each mapped to a (embeds, baseline) -> float callable.
+Metric = namedtuple("Metric", "fn label")
+
+# The --metric CLI choices: a (embeds, baseline) -> float callable and the label of its axis.
 METRICS = {
-    "cosine": cosine_metric,
-    "ccos": ccos_metric,
-    "mi": mi_metric,
-    "nmi": nmi_metric,
-    "cka": cka_metric,
-    "dcka": dcka_metric,
+    "cosine": Metric(cosine_metric, "Cosine similarity to baseline"),
+    "ccos": Metric(ccos_metric, "Centered cosine similarity to baseline"),
+    "nmi": Metric(nmi_metric, "Normalized mutual information with baseline"),
+    "dcka": Metric(dcka_metric, "Debiased CKA similarity to baseline"),
+    "hsic": Metric(hsic_metric, "HSIC relative to the baseline's own"),
 }
 
-# What each metric's numbers mean, for the plot axis label.
-METRIC_LABELS = {
-    "cosine": "Cosine similarity to baseline",
-    "mi": "Mutual information with baseline (nats, per dim)",
-    "ccos": "Centered cosine similarity to baseline",
-    "nmi": "Normalized mutual information with baseline",
-    "cka": "CKA similarity to baseline (biased)",
-    "dcka": "Debiased CKA similarity to baseline",
-}
+
+def metric_label(metric):
+    """The axis label of a metric, its name for a metric no longer computed."""
+    return METRICS[metric].label if metric in METRICS else metric

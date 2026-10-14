@@ -21,3 +21,8 @@ tabfm @ git+https://github.com/google-research/tabfm.git
 loguru
 einx
 boto3
+# LimiX-2 (stable-ai): not on PyPI either, and it lists torch>=2.9.1, so it is installed from a
+# clone without its dependencies (see the readme, "LimiX-2"):
+#     git clone https://github.com/limix-ldm-ai/LimiX.git && pip install --no-deps -e LimiX
+nvtx
+kditransform

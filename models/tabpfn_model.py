@@ -3,7 +3,7 @@ import os
 
 import numpy as np
 
-from models.base_model import BaseTabularPFM
+from models.base_model import NATIVE, BaseTabularPFM
 
 
 def find_hf_checkpoint(repo_id, filename, env_var):
@@ -36,7 +36,8 @@ def find_hf_checkpoint(repo_id, filename, env_var):
 class TabPFN(BaseTabularPFM):
     """Shared TabPFN wrapper, whose final embeddings are exposed by `get_embeddings`.
 
-    The versions live in tabpfn_v2_model.py and tabpfn_v3_model.py.
+    `last` is the output of the library's own `get_embeddings`, a call of its own; every other
+    layer is read with a hook. The versions live in tabpfn_v2_model.py and tabpfn_v3_model.py.
     """
 
     # Tried in order, the first one found gives the layer stack of the transformer.
@@ -46,23 +47,6 @@ class TabPFN(BaseTabularPFM):
         "encoder.layers",
         "model.transformer_encoder.layers",
     )
-    DEFAULT_LAYER = "last"
-
-    def __init__(self, model_path, n_estimators=1, dict_params=None, **kwargs):
-        """
-        Args:
-            model_path (str): The path of the checkpoint, its file name tells the library which
-                TabPFN version to load.
-            n_estimators (int, optional): The size of the ensemble. 1 keeps a single
-                deterministic forward pass. Defaults to 1.
-            dict_params (dict, optional): Extra parameters forwarded to TabPFNClassifier.
-                Defaults to None.
-            kwargs (dict): The parameters of BaseTabularPFM (device, layer, feature_slot).
-        """
-        self.model_path = model_path
-        self.n_estimators = n_estimators
-        self.dict_params = {} if dict_params is None else dict_params
-        super().__init__(**kwargs)
 
     def _build_classifier(self):
         from tabpfn import TabPFNClassifier
@@ -71,21 +55,20 @@ class TabPFN(BaseTabularPFM):
             model_path=self.model_path,
             device=self.device,
             n_estimators=self.n_estimators,
+            random_state=self.seed,
             **self.dict_params,
         )
 
-    def _torch_model(self):
-        model = getattr(self.clf, "model_", None) or getattr(self.clf, "model", None)
-        if model is None:
-            raise RuntimeError("The classifier has to be fitted before its layers can be read")
-        return model
+    def default_layers(self):
+        return self.stack_layers() + ["last"]
+
+    def _named_readouts(self):
+        return {"last": NATIVE}
 
     def _native_embeddings(self, X_test):
         embeddings = np.asarray(self.clf.get_embeddings(X_test))
         if embeddings.ndim == 3:
             # TabPFN returns (n_estimators, n_test, dim): average the ensemble members, as the
-            # hooked layers do, so every layer hands the metrics one (n_test, dim) matrix. With
-            # n_estimators=1 this is the same numbers, so cosine results are unchanged.
+            # hooked layers do, so every layer hands the metrics one (n_test, dim) matrix.
             embeddings = embeddings.mean(axis=0)
         return embeddings
-

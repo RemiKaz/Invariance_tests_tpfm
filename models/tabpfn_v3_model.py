@@ -1,9 +1,5 @@
+from models.base_model import Readout
 from models.tabpfn_model import TabPFN, find_hf_checkpoint
-
-# TABPFN_V3_CKPT overrides the path.
-DEFAULT_MODEL_PATH = find_hf_checkpoint(
-    "Prior-Labs/tabpfn_3", "tabpfn-v3-classifier-v3_default.ckpt", "TABPFN_V3_CKPT"
-)
 
 
 class TabPFNV3(TabPFN):
@@ -17,12 +13,21 @@ class TabPFNV3(TabPFN):
       before the ICL stage, one vector per row.
     - `tf_icl`: the end of the ICL transformer, after its output norm, what the decoder
       reads. One vector per row.
+
+    The blocks inside the two first stages can be read too: `col_<i>` (layer `i` of
+    `feature_distribution_embedder`, read like `tf_col`, its last layer being `tf_col`
+    itself) and `row_<i>` (block `i` of `column_aggregator`, the CLS tokens read like
+    `tf_row`; its last block does the CLS-only readout and is called directly, so it is
+    `tf_row` itself). The blocks of the ICL transformer are `--layer <index>`.
     """
 
     # The main (in-context) transformer, addressed by `--layer <index>`. The column
     # aggregator and the feature embedder have their own stacks, reachable by name.
     LAYER_CONTAINERS = ("icl_blocks",) + TabPFN.LAYER_CONTAINERS
-    DEFAULT_MODEL_PATH = DEFAULT_MODEL_PATH
+    # TABPFN_V3_CKPT overrides the path.
+    DEFAULT_MODEL_PATH = find_hf_checkpoint(
+        "Prior-Labs/tabpfn_3", "tabpfn-v3-classifier-v3_default.ckpt", "TABPFN_V3_CKPT"
+    )
     STAGES = {
         "tf_col": "feature_distribution_embedder",
         "tf_row": "column_aggregator",
@@ -30,54 +35,63 @@ class TabPFNV3(TabPFN):
     }
     LAYER_ALIASES = STAGES
 
-    def _hooked_embeddings(self, X_test, layer):
-        name, _ = self._resolve_layer(layer)
+    def _n_blocks(self):
+        model = self._torch_model()
+        return {
+            "col": len(model.feature_distribution_embedder.layers),
+            "row": len(model.column_aggregator.blocks) - 1,  # the last one is tf_row
+        }
+
+    def default_layers(self):
+        n = self._n_blocks()
+        # the last layer of the distribution embedder is tf_col, it is not listed twice
+        return (
+            [f"col_{i}" for i in range(n["col"] - 1)]
+            + ["tf_col"]
+            + [f"row_{i}" for i in range(n["row"])]
+            + ["tf_row"]
+            + self.stack_layers()
+            + ["tf_icl", "last"]
+        )
+
+    def _named_readouts(self):
+        n = self._n_blocks()
+        named = super()._named_readouts()
+        named.update(
+            {f"col_{i}": self._stage_readout(f"feature_distribution_embedder.layers.{i}", "col") for i in range(n["col"])}
+        )
+        named.update({f"row_{i}": self._stage_readout(f"column_aggregator.blocks.{i}", "row_block") for i in range(n["row"])})
+        return named
+
+    def _module_readout(self, name):
         if name in self.STAGES.values():
-            return self._stage_embeddings(X_test, name)
-        return super()._hooked_embeddings(X_test, layer)
+            return self._stage_readout(name, {self.STAGES["tf_col"]: "col", self.STAGES["tf_row"]: "row"}.get(name))
+        return super()._module_readout(name)
 
-    def _stage_embeddings(self, X_test, name):
-        """Capture the output of one stage during a forward pass on `X_test`.
+    def _stage_readout(self, name, kind):
+        """Read one stage, or a block inside one.
 
-        Long tables are processed in row chunks, which call the stage once per chunk, so
-        the calls of the last forward pass are gathered and put back together.
+        `kind` says how the captured activations become one vector per row: "col" (the cells,
+        averaged or flattened), "row" (the CLS tokens of the aggregator's output, concatenated),
+        "row_block" (the CLS tokens of a block inside the aggregator, which also holds the
+        feature tokens) or None (as they are).
+
+        Long tables are processed in row chunks, which call the stage once per chunk, so the
+        calls of the last forward pass are gathered and put back together.
         """
         import torch
 
-        model = self._torch_model()
-        # ("stage", output) per call of the stage, ("pass", None) at the end of each pass.
-        events = []
+        n_cls = self._torch_model().column_aggregator.num_cls_tokens  # the CLS tokens come first
 
-        def on_stage(_module, _inputs, output):
-            output = output[0] if isinstance(output, tuple) else output
-            events.append(("stage", output.detach().to("cpu", torch.float32, copy=True)))
+        def reduce(capture):
+            # (tables, rows, ...): the row chunks are put back in order along the rows.
+            activations = torch.cat(capture.chunks, dim=1)
+            if kind == "col":
+                return self._cells_without_target(activations)
+            if kind == "row":
+                return activations.flatten(start_dim=-2)  # the CLS tokens, concatenated
+            if kind == "row_block":
+                return activations[..., :n_cls, :].flatten(start_dim=-2)
+            return self._cells(activations)
 
-        handles = [
-            model.get_submodule(name).register_forward_hook(on_stage),
-            model.register_forward_hook(lambda *_: events.append(("pass", None))),
-        ]
-        try:
-            self.clf.predict_proba(X_test)
-        finally:
-            for handle in handles:
-                handle.remove()
-
-        ends = [i for i, (kind, _) in enumerate(events) if kind == "pass"]
-        if not ends:
-            raise RuntimeError(f"The hook on {name} never fired during predict_proba")
-        start = ends[-2] + 1 if len(ends) > 1 else 0
-        chunks = [value for kind, value in events[start : ends[-1]] if kind == "stage"]
-        if not chunks:
-            raise RuntimeError(f"The hook on {name} never fired during the last forward pass")
-
-        # (tables, rows, ...): the row chunks are put back in order along the rows.
-        activations = torch.cat(chunks, dim=1)
-        if self.verbose:
-            print(f"  captured {name}: {tuple(activations.shape)}")
-            self.verbose = False  # only report the first capture of a run
-
-        if name == self.STAGES["tf_col"]:
-            activations = self._reduce_cells_without_target(activations, "tf_col")
-        elif name == self.STAGES["tf_row"]:
-            activations = activations.flatten(start_dim=-2)  # the CLS tokens, concatenated
-        return self._reduce_activations(activations, len(X_test))
+        return Readout(name, reduce, end="")
