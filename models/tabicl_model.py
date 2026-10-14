@@ -1,4 +1,4 @@
-from models.base_model import BaseTabularPFM
+from models.base_model import BaseTabularPFM, Readout
 
 
 class TabICL(BaseTabularPFM):
@@ -20,54 +20,27 @@ class TabICL(BaseTabularPFM):
       transformer, i.e. its output after the final LayerNorm, which is what the decoder
       reads to predict. One vector per row.
 
-    `tf_col` and `tf_row` are each a stack of blocks (`col_embedder.tf_col.blocks`,
-    `row_interactor.tf_row.blocks`), read at their very end. `tf_col_early` / `tf_col_middle`
-    and `tf_row_early` / `tf_row_middle` read them at an earlier block instead (closing the
-    first quarter / half of that stack), the same way as the stage's own final output: the
-    per-cell mean/flatten for `tf_col_*`, the CLS-token slots for `tf_row_*` (every block
-    writes into the same reserved slots, refining them further each time, so reading them
-    mid-stack gives an earlier snapshot of the same representation `tf_row` itself reads).
-    `tf_row`'s last block does the CLS-only pooling and has no equivalent mid-stack reading,
-    so `tf_row_early` / `tf_row_middle` are computed over its other blocks only.
+    Every block of the three stages can be read by its index, `col_<i>` (of tf_col, read like
+    `tf_col`), `row_<i>` (of tf_row, the CLS-token slots read like `tf_row`: every block writes
+    into the same reserved slots, so a block gives an earlier snapshot of the same
+    representation) and `icl_<i>` (of the ICL transformer, read like `tf_icl`). The last block of
+    tf_row does the CLS-only pooling and is `tf_row` itself. `tf_col_early` / `tf_col_middle` and
+    `tf_row_early` / `tf_row_middle` name the blocks closing the first quarter / half of a stage.
     """
 
-    TAKES_SEED = True
     LAYER_CONTAINERS = (
         "row_interactor.layers",
         "row_interactor",
         "tf_icl.layers",
         "icl_predictor.layers",
     )
-    # "last" is the end of TF_icl, see `_native_embeddings`.
-    DEFAULT_LAYER = "last"
+    LAYER_ALIASES = {"tf_row": "row_interactor", "tf_col": "col_embedder.tf_col"}
+    TF_COL = "col_embedder.tf_col"
+    # Fractional depths of tf_col and tf_row, read like their stage's own final output.
+    STAGE_DEPTHS = {"early": 0.25, "middle": 0.5}
     # The checkpoint TabICL downloads when no model_path is given, None keeps the library
     # default. Set by the version subclasses to pin the version.
     CHECKPOINT_VERSION = None
-    DEFAULT_MODEL_PATH = None
-    LAYER_ALIASES = {"tf_row": "row_interactor", "tf_col": "col_embedder.tf_col"}
-    TF_COL_NAME = "col_embedder.tf_col"
-    # Fractional depths of tf_col and tf_row, read like their stage's own final output.
-    STAGE_DEPTHS = {"early": 0.25, "middle": 0.5}
-
-    def __init__(self, model_path=None, n_estimators=1, seed=0, dict_params=None, **kwargs):
-        """
-        Args:
-            model_path (str, optional): The path of the checkpoint, None lets TabICL
-                download it from HuggingFace, which does not work from a compute node
-                without internet access. Defaults to None.
-            n_estimators (int, optional): The size of the ensemble. 1 keeps a single
-                deterministic forward pass, so the captured representations are not an
-                average over shuffled ensembles. Defaults to 1.
-            seed (int, optional): The random state of the classifier. Defaults to 0.
-            dict_params (dict, optional): Extra parameters forwarded to TabICLClassifier.
-                Defaults to None.
-            kwargs (dict): The parameters of BaseTabularPFM (device, layer, feature_slot).
-        """
-        self.model_path = model_path
-        self.n_estimators = n_estimators
-        self.seed = seed
-        self.dict_params = {} if dict_params is None else dict_params
-        super().__init__(**kwargs)
 
     def _build_classifier(self):
         from tabicl import TabICLClassifier
@@ -84,165 +57,96 @@ class TabICL(BaseTabularPFM):
             **params,
         )
 
-    def _torch_model(self):
-        model = getattr(self.clf, "model_", None) or getattr(self.clf, "model", None)
-        if model is None:
-            raise RuntimeError("The classifier has to be fitted before its layers can be read")
-        return model
+    def _n_blocks(self):
+        """The number of readable blocks of the col, row and icl stages."""
+        model = self._torch_model()
+        return {
+            "col": len(model.col_embedder.tf_col.blocks),
+            # the last block of the row stage does the CLS-only pooling, it is `tf_row` itself
+            "row": len(model.row_interactor.tf_row.blocks) - 1,
+            "icl": len(model.icl_predictor.tf_icl.blocks),
+        }
 
-    def _native_embeddings(self, X_test):
-        return self._hooked_embeddings(X_test, self._tf_icl_module_name())
+    def default_layers(self):
+        n = self._n_blocks()
+        # the last column block is the output of tf_col, it is not listed twice
+        return (
+            [f"col_{i}" for i in range(n["col"] - 1)]
+            + ["tf_col"]
+            + [f"row_{i}" for i in range(n["row"])]
+            + ["tf_row"]
+            + [f"icl_{i}" for i in range(n["icl"])]
+            + ["tf_icl"]
+        )
 
-    def _tf_icl_module_name(self):
-        """The module whose output is the end of TF_icl, just before the decoder."""
+    def _named_readouts(self):
+        model = self._torch_model()
         # The final LayerNorm only exists for pre-norm models, otherwise TF_icl ends itself.
-        has_final_norm = hasattr(self._torch_model().icl_predictor, "ln")
-        return "icl_predictor.ln" if has_final_norm else "icl_predictor.tf_icl"
+        tf_icl = "icl_predictor.ln" if hasattr(model.icl_predictor, "ln") else "icl_predictor.tf_icl"
+        n = self._n_blocks()
+        named = {"tf_icl": self._module_readout(tf_icl)}
+        named["last"] = named["tf_icl"]
+        named.update({f"col_{i}": self._tf_col_readout(f"{self.TF_COL}.blocks.{i}") for i in range(n["col"])})
+        named.update({f"row_{i}": self._row_block_readout(i) for i in range(n["row"])})
+        named.update(
+            {f"icl_{i}": self._module_readout(f"icl_predictor.tf_icl.blocks.{i}") for i in range(n["icl"])}
+        )
+        for depth, fraction in self.STAGE_DEPTHS.items():
+            named[f"tf_col_{depth}"] = named[f"col_{self._depth_index(n['col'], fraction)}"]
+            if n["row"] > 0:
+                named[f"tf_row_{depth}"] = named[f"row_{self._depth_index(n['row'], fraction)}"]
+        return named
 
-    def _hooked_embeddings(self, X_test, layer):
-        for stage in ("tf_col", "tf_row"):
-            for depth, fraction in self.STAGE_DEPTHS.items():
-                if layer == f"{stage}_{depth}":
-                    return self._stage_depth_embeddings(X_test, stage, fraction)
-        if layer == "tf_icl":
-            layer = self._tf_icl_module_name()
-        name, _ = self._resolve_layer(layer)
-        if name == self.TF_COL_NAME:
-            return self._tf_col_embeddings(X_test)
-        return super()._hooked_embeddings(X_test, layer)
+    def _module_readout(self, name):
+        if name == self.TF_COL:
+            return self._tf_col_readout(name)
+        return super()._module_readout(name)
 
-    def _stage_depth_embeddings(self, X_test, stage, fraction):
-        """Dispatch `tf_col_early` / `middle` and `tf_row_early` / `middle` to their stage."""
-        model = self._torch_model()
-        if stage == "tf_col":
-            blocks = model.col_embedder.tf_col.blocks
-            index = self._depth_index(len(blocks), fraction)
-            return self._tf_col_embeddings(X_test, f"{self.TF_COL_NAME}.blocks.{index}")
+    def _tf_col_readout(self, module):
+        """Read the column-wise stage `col_embedder.tf_col`, or one of its blocks.
 
-        blocks = model.row_interactor.tf_row.blocks
-        n_regular = len(blocks) - 1  # the last block does the CLS-only pooling, see tf_row
-        if n_regular <= 0:
-            raise ValueError(
-                f"row_interactor.tf_row has only {len(blocks)} block(s), no block left to "
-                f"read tf_row_early / tf_row_middle at, distinct from tf_row itself"
-            )
-        index = self._depth_index(n_regular, fraction)
-        return self._row_block_embeddings(X_test, index)
-
-    def _tf_col_embeddings(self, X_test, module_name=None):
-        """Capture the output of a submodule of the column-wise stage during a forward pass.
-
-        Defaults to the whole `col_embedder.tf_col` (TF_COL_NAME), its output after every
-        block; `_stage_depth_embeddings` instead passes one of its own blocks' dotted name,
-        for `tf_col_early` / `tf_col_middle`. Either way the inference manager may split the
-        columns over several calls of that submodule, and a prediction may run several
-        forward passes (one per ensemble batch), so the calls of the last pass are gathered
-        and put back together.
+        The inference manager may split the columns over several calls of that submodule, and
+        a prediction may run several forward passes (one per ensemble batch): the output of
+        `col_embedder` closes a pass, its shape says how the calls of the last one fit
+        together.
         """
         import torch
 
-        module_name = module_name or self.TF_COL_NAME
-        model = self._torch_model()
-        stage = model.get_submodule(module_name)
-        col_embedder = model.col_embedder
-        # ("tf_col", output) per call of `stage`, ("col", output shape) once the whole column
-        # stage is assembled - marks the end of one pass, whatever `stage` is.
-        events = []
-        handles = [
-            stage.register_forward_hook(
-                lambda _module, _inputs, output: events.append(
-                    ("tf_col", output.detach().float().cpu())
+        col_embedder = self._torch_model().col_embedder
+
+        def reduce(capture):
+            n_tables, _, n_columns, _ = capture.end_shape
+            # Each call is shaped (..., rows, dim), the leading dims index the columns.
+            columns = torch.cat([chunk.reshape(-1, *chunk.shape[-2:]) for chunk in capture.chunks])
+            if columns.shape[0] == n_tables * n_columns:
+                columns = columns.reshape(n_tables, n_columns, *columns.shape[-2:])
+            elif columns.shape[0] == n_columns:
+                # Feature-shuffled ensembles embed the columns once and reorder them per table.
+                columns = columns.unsqueeze(0)
+            else:
+                raise RuntimeError(
+                    f"Captured {columns.shape[0]} column embeddings from {module}, "
+                    f"expected {n_tables * n_columns} ({n_tables} tables x {n_columns} columns)"
                 )
-            ),
-            col_embedder.register_forward_hook(
-                lambda _module, _inputs, output: events.append(("col", tuple(output.shape)))
-            ),
-        ]
-        try:
-            self.clf.predict_proba(X_test)
-        finally:
-            for handle in handles:
-                handle.remove()
+            # (tables, reserved + features, rows, dim) -> (tables, rows, features, dim), where
+            # the first columns are reserved for the CLS tokens and carry no feature.
+            activations = columns[:, col_embedder.reserve_cls_tokens :].transpose(1, 2)
+            return self._cells_without_target(activations)
 
-        ends = [i for i, (kind, _) in enumerate(events) if kind == "col"]
-        if not ends:
-            raise RuntimeError(f"The hook on {module_name} never fired during predict_proba")
-        start = ends[-2] + 1 if len(ends) > 1 else 0
-        chunks = [value for kind, value in events[start : ends[-1]] if kind == "tf_col"]
-        n_tables, _, n_columns, _ = events[ends[-1]][1]
+        return Readout(module, reduce, end="col_embedder")
 
-        # Each call is shaped (..., rows, dim), the leading dims index the columns.
-        columns = torch.cat([chunk.reshape(-1, *chunk.shape[-2:]) for chunk in chunks])
-        if columns.shape[0] == n_tables * n_columns:
-            columns = columns.reshape(n_tables, n_columns, *columns.shape[-2:])
-        elif columns.shape[0] == n_columns:
-            # Feature-shuffled ensembles embed the columns once and reorder them per table.
-            columns = columns.unsqueeze(0)
-        else:
-            raise RuntimeError(
-                f"Captured {columns.shape[0]} column embeddings from {module_name}, "
-                f"expected {n_tables * n_columns} ({n_tables} tables x {n_columns} columns)"
-            )
+    def _row_block_readout(self, index):
+        """Read the CLS-token slots after one (non-final) block of the row transformer.
 
-        # (tables, reserved + features, rows, dim) -> (tables, rows, features, dim), where
-        # the first columns are reserved for the CLS tokens and carry no feature.
-        n_reserved = col_embedder.reserve_cls_tokens
-        activations = columns[:, n_reserved:].transpose(1, 2)
-        if self.verbose:
-            print(f"  captured {module_name}: {tuple(activations.shape)}")
-            self.verbose = False  # only report the first capture of a run
-
-        activations = self._reduce_cells_without_target(activations, "tf_col")
-        return self._reduce_activations(activations, len(X_test))
-
-    def _row_block_embeddings(self, X_test, index):
-        """Capture the CLS-token slots after one (non-final) block of the row transformer.
-
-        Read the same way as `tf_row` itself (the concatenated CLS tokens), just at an
-        earlier depth: every block writes into the same reserved slots the column stage set
-        aside, refining them further with each subsequent block, so slicing them out of an
-        intermediate block's raw (rows, cls + features, dim) output gives an earlier,
-        comparable snapshot of the same representation. Long tables may be processed in row
-        chunks, gathered from the last forward pass, same idea as `_tf_col_embeddings`.
+        Long tables may be processed in row chunks; the output of `row_interactor` closes a
+        pass, its own hook firing after every nested block hook it triggered.
         """
         import torch
 
-        model = self._torch_model()
-        row_interactor = model.row_interactor
-        block = row_interactor.tf_row.blocks[index]
-        module_name = f"row_interactor.tf_row.blocks.{index}"
-        n_cls = row_interactor.num_cls
+        n_cls = self._torch_model().row_interactor.num_cls
 
-        # ("block", output) per call of `block`, ("pass", None) once row_interactor itself
-        # returns - marks the end of one pass, its own forward hook fires after every nested
-        # block hook it triggered.
-        events = []
-        handles = [
-            block.register_forward_hook(
-                lambda _module, _inputs, output: events.append(
-                    ("block", output.detach().float().cpu())
-                )
-            ),
-            row_interactor.register_forward_hook(lambda *_: events.append(("pass", None))),
-        ]
-        try:
-            self.clf.predict_proba(X_test)
-        finally:
-            for handle in handles:
-                handle.remove()
+        def reduce(capture):
+            activations = torch.cat(capture.chunks, dim=1)  # (tables, rows, cls + features, dim)
+            return activations[..., :n_cls, :].flatten(start_dim=-2)  # the CLS tokens
 
-        ends = [i for i, (kind, _) in enumerate(events) if kind == "pass"]
-        if not ends:
-            raise RuntimeError(f"The hook on {module_name} never fired during predict_proba")
-        start = ends[-2] + 1 if len(ends) > 1 else 0
-        chunks = [value for kind, value in events[start : ends[-1]] if kind == "block"]
-        if not chunks:
-            raise RuntimeError(f"The hook on {module_name} never fired during the last forward pass")
-
-        activations = torch.cat(chunks, dim=1)  # (tables, rows, cls + features, dim)
-        activations = activations[..., :n_cls, :].flatten(start_dim=-2)  # the CLS tokens
-        if self.verbose:
-            print(f"  captured {module_name}: {tuple(activations.shape)}")
-            self.verbose = False  # only report the first capture of a run
-
-        return self._reduce_activations(activations, len(X_test))
+        return Readout(f"row_interactor.tf_row.blocks.{index}", reduce, end="row_interactor")
